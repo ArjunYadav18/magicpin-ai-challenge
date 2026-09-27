@@ -1,0 +1,595 @@
+from __future__ import annotations
+
+import json
+import logging
+from datetime import datetime
+from typing import Any, Optional
+
+import httpx
+
+from app.config import get_settings
+from app.prompts import SYSTEM_PROMPT, build_prompt, build_reply_prompt
+from app.validator import FactValidator
+
+logger = logging.getLogger(__name__)
+
+
+class LLMComposer:
+    def __init__(self) -> None:
+        self.settings = get_settings()
+
+    async def _call_llm(self, system: str, user: str) -> dict[str, Any]:
+        if not self.settings.llm_enabled:
+            return {}
+
+        provider = self.settings.llm_provider
+        api_key = self.settings.llm_api_key
+        model = self.settings.llm_model
+
+        try:
+            async with httpx.AsyncClient(timeout=self.settings.llm_timeout_seconds) as client:
+                if provider == "openai":
+                    resp = await client.post(
+                        "https://api.openai.com/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        json={
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": user},
+                            ],
+                            "response_format": {"type": "json_object"},
+                            "temperature": 0.2,
+                        },
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["choices"][0]["message"]["content"]
+                    return json.loads(content)
+
+                if provider == "anthropic":
+                    resp = await client.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={
+                            "x-api-key": api_key,
+                            "anthropic-version": "2023-06-01",
+                        },
+                        json={
+                            "model": model,
+                            "system": system,
+                            "messages": [{"role": "user", "content": user}],
+                            "temperature": 0.2,
+                            "max_tokens": 512,
+                        },
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["content"][0]["text"]
+                    return json.loads(content)
+
+                if provider == "gemini":
+                    # API-key header is preferable to putting the key in the URL.
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                    resp = await client.post(
+                        url,
+                        headers={"x-goog-api-key": api_key},
+                        json={
+                            "systemInstruction": {"parts": [{"text": system}]},
+                            "contents": [{"parts": [{"text": user}]}],
+                            "generationConfig": {
+                                "temperature": 0.2,
+                                "responseMimeType": "application/json",
+                            },
+                        },
+                    )
+                    resp.raise_for_status()
+                    content = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    return json.loads(content)
+
+                logger.warning("Unsupported LLM provider: %s", provider)
+                return {}
+        except Exception as exc:
+            logger.error("LLM call failed: %s", exc)
+            return {}
+
+    async def compose_tick(
+        self,
+        category: Optional[dict[str, Any]],
+        merchant: dict[str, Any],
+        trigger: dict[str, Any],
+        customer: Optional[dict[str, Any]],
+        digest_item: Optional[dict[str, Any]],
+        family: str,
+        is_customer_facing: bool,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (body, cta, rationale)."""
+        if not self.settings.llm_enabled:
+            return self._deterministic_tick(
+                category,
+                merchant,
+                trigger,
+                customer,
+                digest_item,
+                family,
+                is_customer_facing,
+            )
+
+        prompt = build_prompt(
+            category,
+            merchant,
+            trigger,
+            customer,
+            digest_item,
+            family,
+            is_customer_facing,
+        )
+        result = await self._call_llm(SYSTEM_PROMPT, prompt)
+
+        if not result or result.get("decision") == "no_send":
+            return None, None, None
+
+        body = result.get("body")
+        cta = result.get("cta", "open_ended")
+        rationale = result.get("rationale", "Generated by LLM")
+
+        if not body:
+            return None, None, None
+
+        validator = FactValidator(category, merchant, trigger, customer, digest_item)
+        errors = validator.validate_message(body)
+        if errors:
+            logger.warning("Message failed validation: %s", errors)
+            # A bad LLM response should not kill the action entirely.
+            # Fall back to the deterministic, fact-grounded composer.
+            return self._deterministic_tick(
+                category,
+                merchant,
+                trigger,
+                customer,
+                digest_item,
+                family,
+                is_customer_facing,
+            )
+
+        return body, cta, rationale
+
+    async def compose_reply(
+        self,
+        history: list[dict[str, Any]],
+        message: str,
+        intent: str,
+        merchant: Optional[dict[str, Any]],
+        category: Optional[dict[str, Any]],
+        customer: Optional[dict[str, Any]],
+        pending_action: Optional[str],
+    ) -> dict[str, Any]:
+        if not self.settings.llm_enabled:
+            return self._deterministic_reply(intent, pending_action)
+
+        prompt = build_reply_prompt(
+            history, message, intent, merchant, category, customer, pending_action
+        )
+        result = await self._call_llm(SYSTEM_PROMPT, prompt)
+
+        if not result:
+            return self._deterministic_reply(intent, pending_action)
+
+        action = result.get("decision", "send")
+        if action not in ("send", "wait", "end"):
+            action = "send"
+
+        return {
+            "action": action,
+            "body": result.get("body", ""),
+            "cta": result.get("cta", "none"),
+            "wait_seconds": int(result.get("wait_seconds", 0)),
+            "rationale": result.get("rationale", "LLM reply"),
+        }
+
+    # ------------------------------------------------------------------
+    # Deterministic composition
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _owner(merchant: dict[str, Any]) -> str:
+        ident = merchant.get("identity") or {}
+        first = ident.get("owner_first_name")
+        return f"Dr. {first}" if merchant.get("category_slug") == "dentists" and first else str(first or ident.get("name") or "there")
+
+    @staticmethod
+    def _merchant_name(merchant: dict[str, Any]) -> str:
+        return str((merchant.get("identity") or {}).get("name") or "the business")
+
+    @staticmethod
+    def _percent_points(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        # Trigger payloads use decimal fractions for percentage deltas (0.15 = 15%).
+        return number * 100.0 if abs(number) <= 1.0 else number
+
+    @staticmethod
+    def _clean_percent(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return str(value)
+        if number.is_integer():
+            return str(int(number))
+        return f"{number:g}"
+
+    @staticmethod
+    def _date(value: Any) -> str:
+        if not value:
+            return ""
+        text = str(value)
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            return dt.strftime("%d %b %Y")
+        except ValueError:
+            # YYYY-MM-DD is already safe and readable.
+            if len(text) == 10 and text[4] == "-" and text[7] == "-":
+                try:
+                    return datetime.strptime(text, "%Y-%m-%d").strftime("%d %b %Y")
+                except ValueError:
+                    pass
+            return text
+
+    @staticmethod
+    def _active_offer(merchant: dict[str, Any], keywords: tuple[str, ...] = ()) -> Optional[str]:
+        offers = [o for o in merchant.get("offers") or [] if str(o.get("status", "active")).lower() == "active"]
+        if not offers:
+            return None
+        if keywords:
+            for offer in offers:
+                title = str(offer.get("title") or "")
+                if any(k.lower() in title.lower() for k in keywords):
+                    return title
+        return str(offers[0].get("title") or "") or None
+
+    @staticmethod
+    def _slot_text(payload: dict[str, Any], preferred: str = "") -> Optional[str]:
+        slots = payload.get("available_slots") or payload.get("next_session_options") or []
+        if not slots:
+            return None
+        # Prefer a slot that matches the customer's preference when possible.
+        preferred = preferred.lower()
+        for slot in slots:
+            label = str(slot.get("label") or "")
+            low = label.lower()
+            if "evening" in preferred and any(x in low for x in ("5pm", "6pm", "7pm", "8pm")):
+                return label
+            if "morning" in preferred and any(x in low for x in ("7am", "8am", "9am", "10am")):
+                return label
+        return str(slots[0].get("label") or slots[0].get("iso") or "") or None
+
+    def _deterministic_tick(
+        self,
+        category: Optional[dict[str, Any]],
+        merchant: dict[str, Any],
+        trigger: Optional[dict[str, Any]] = None,
+        customer: Optional[dict[str, Any]] = None,
+        digest_item: Optional[dict[str, Any]] = None,
+        family: str = "general",
+        is_customer_facing: bool = False,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        # Backward compatibility with the original internal helper signature:
+        # _deterministic_tick(trigger, merchant, customer, family, is_customer_facing)
+        if trigger is None and isinstance(category, dict) and isinstance(customer, str):
+            legacy_trigger = category
+            legacy_family = customer
+            legacy_is_customer = bool(digest_item)
+            category = None
+            trigger = legacy_trigger
+            customer = None
+            digest_item = None
+            family = legacy_family
+            is_customer_facing = legacy_is_customer
+
+        trigger = trigger or {}
+        ident = merchant.get("identity") or {}
+        owner = self._owner(merchant)
+        payload = trigger.get("payload") or {}
+        cat_slug = str((category or {}).get("slug") or merchant.get("category_slug") or "")
+
+        if is_customer_facing:
+            return self._customer_message(merchant, trigger, customer, family)
+
+        if family == "compliance":
+            return self._compliance_message(owner, payload, digest_item)
+
+        if family == "research":
+            return self._research_message(owner, payload, digest_item)
+
+        if family == "performance":
+            metric = str(payload.get("metric") or payload.get("metric_name") or "performance")
+            delta_points = self._percent_points(payload.get("delta_pct"))
+            delta = self._clean_percent(delta_points)
+            window = str(payload.get("window") or "recently")
+            seasonal = bool(payload.get("is_expected_seasonal"))
+            if delta is not None:
+                direction = "up" if (delta_points or 0) >= 0 else "down"
+                if direction == "up":
+                    sentence = f"your {metric} is up {delta}% over {window}"
+                else:
+                    sentence = f"your {metric} is down {abs(delta_points or 0):g}% over {window}"
+                if seasonal:
+                    season_note = payload.get("season_note")
+                    body = f"Hi {owner} — {sentence}. This looks seasonal rather than a broad profile issue."
+                    if season_note:
+                        body += f" The context flags {str(season_note).replace('_', ' ')}."
+                    body += " Want me to suggest one low-effort adjustment?"
+                else:
+                    body = f"Hi {owner} — {sentence}. Want me to suggest one concrete change to recover it?"
+                return body, "binary_yes_no", f"Performance trigger grounded in {metric}, {delta}% and {window}."
+
+        if family == "renewal":
+            days = payload.get("days_remaining") or payload.get("days_left")
+            plan = payload.get("plan_name") or payload.get("plan") or "your plan"
+            amount = payload.get("renewal_amount")
+            amount_text = f" at ₹{amount}" if amount is not None else ""
+            if days is not None:
+                body = f"Hi {owner} — your {plan} renewal is in {days} days{amount_text}."
+                body += " Want me to outline what needs to be done to keep the listing active?"
+                return body, "binary_yes_no", "Renewal timing and plan were taken directly from the trigger."
+
+        if family == "seasonal":
+            event = payload.get("festival") or payload.get("match") or payload.get("season") or "the upcoming event"
+            date = payload.get("date") or payload.get("match_time_iso")
+            location = payload.get("venue") or payload.get("city")
+            trend = payload.get("trends")
+            body = f"Hi {owner} — {event} is the timely opportunity here"
+            if date:
+                body += f" on {self._date(date)}"
+            if location:
+                body += f" in {location}"
+            body += "."
+            if trend:
+                body += f" The category signal is {', '.join(str(x).replace('_', ' ') for x in trend[:2])}."
+            body += " Want me to turn this into one concrete offer or campaign idea?"
+            return body, "binary_yes_no", "Seasonal/event message grounded in the supplied event facts."
+
+        if family == "planning":
+            topic = str(payload.get("intent_topic") or payload.get("ask_template") or "the request").replace("_", " ")
+            last_message = payload.get("merchant_last_message")
+            if last_message:
+                body = f"Hi {owner} — for your {topic}, I can turn the idea into a ready-to-use plan."
+                if "corporate" in topic.lower() and self._active_offer(merchant, ("thali", "lunch")):
+                    body += f" Your current offer is {self._active_offer(merchant, ('thali', 'lunch'))}."
+                body += " Want me to draft the offer, audience and message together?"
+            else:
+                body = f"Hi {owner} — I can help with {topic}. Want me to draft the first version using your current listing and offers?"
+            return body, "open_ended", "Planning message advances the existing merchant intent with a concrete deliverable."
+
+        if family == "growth":
+            kind = str(trigger.get("kind") or "")
+            if "competitor" in kind:
+                competitor = payload.get("competitor_name") or "a nearby competitor"
+                distance = payload.get("distance_km")
+                offer = payload.get("their_offer")
+                body = f"Hi {owner} — {competitor} has opened"
+                if distance is not None:
+                    body += f" {distance} km away"
+                if offer:
+                    body += f" with {offer}"
+                body += ". Want me to suggest a response using your existing positioning?"
+                return body, "binary_yes_no", "Competitor message uses the supplied distance and offer."
+
+            if "gbp_unverified" in kind:
+                uplift = self._clean_percent(float(payload.get("estimated_uplift_pct", 0)) * 100) if payload.get("estimated_uplift_pct") is not None else None
+                body = f"Hi {owner} — your Google Business Profile is still unverified."
+                if uplift:
+                    body += f" The supplied estimate is up to {uplift}% uplift."
+                body += " Want the verification path in one short checklist?"
+                return body, "binary_yes_no", "GBP message uses verification status and supplied estimate."
+
+            if "milestone" in kind:
+                metric = payload.get("metric") or "metric"
+                now_value = payload.get("value_now")
+                milestone = payload.get("milestone_value")
+                body = f"Hi {owner} — your {metric.replace('_', ' ')} is at {now_value}, just {int(milestone) - int(now_value)} away from {milestone}."
+                body += " Want me to suggest one way to use the milestone?"
+                return body, "binary_yes_no", "Milestone message uses the supplied current and target values."
+
+            if "winback" in kind:
+                days = payload.get("days_since_expiry")
+                lapsed = payload.get("lapsed_customers_added_since_expiry")
+                dip = payload.get("perf_dip_pct")
+                body = f"Hi {owner} — it has been {days} days since expiry"
+                if lapsed is not None:
+                    body += f", and {lapsed} lapsed customers have accumulated"
+                if dip is not None:
+                    body += f" while performance is {abs(float(dip))*100:g}% lower"
+                body += ". Want me to draft a win-back message using your existing audience?"
+                return body, "binary_yes_no", "Win-back message uses the trigger's timing and performance facts."
+
+            if "dormant" in kind:
+                days = payload.get("days_since_last_merchant_message")
+                topic = payload.get("last_topic")
+                body = f"Hi {owner} — we last spoke {days} days ago"
+                if topic:
+                    body += f" about {str(topic).replace('_', ' ')}"
+                body += ". Want me to pick up from there with one useful next step?"
+                return body, "binary_yes_no", "Dormancy message references the actual gap and last topic."
+
+        # General / review-theme fallback.
+        metric_or_topic = payload.get("metric_or_topic") or payload.get("topic") or payload.get("theme")
+        if metric_or_topic:
+            body = f"Hi {owner} — I spotted a {str(metric_or_topic).replace('_', ' ')} signal worth acting on."
+            if payload.get("occurrences_30d") is not None:
+                body += f" It has appeared {payload['occurrences_30d']} times in the last 30 days."
+            body += " Want me to suggest one concrete next step?"
+            return body, "binary_yes_no", "General fallback still includes a trigger fact."
+
+        # Last-resort message. This should be rare and remains intentionally short.
+        body = f"Hi {owner} — I have a relevant update for {cat_slug or 'your business'}. Want me to prepare the useful takeaway?"
+        return body, "open_ended", "Last-resort deterministic fallback."
+
+    def _compliance_message(
+        self,
+        owner: str,
+        payload: dict[str, Any],
+        digest: Optional[dict[str, Any]],
+    ) -> tuple[str, str, str]:
+        title = str((digest or {}).get("title") or "the regulation update")
+        deadline = self._date(payload.get("deadline_iso") or (digest or {}).get("effective_date"))
+        summary = str((digest or {}).get("summary") or "")
+        actionable = str((digest or {}).get("actionable") or "")
+        body = f"Hi {owner} — {title}."
+
+        if deadline:
+            body += f" The relevant date is {deadline}."
+
+        if summary:
+            first = summary.split(". ")[0].strip().rstrip(".")
+            if first:
+                body += f" {first}."
+
+        if actionable:
+            body += f" For your practice, {actionable.lower()}."
+
+        body += " Want me to turn this into a 3-point compliance checklist?"
+        return body, "binary_yes_no", "Compliance message uses the linked digest, deadline and concrete action."
+
+    def _research_message(
+        self,
+        owner: str,
+        payload: dict[str, Any],
+        digest: Optional[dict[str, Any]],
+    ) -> tuple[str, str, str]:
+        item = digest or {}
+        title = str(item.get("title") or payload.get("topic") or "the latest research update")
+        source = str(item.get("source") or "the supplied research source")
+        trial_n = item.get("trial_n")
+        summary = str(item.get("summary") or "")
+        body = f"Hi {owner} — {title} ({source})"
+        if trial_n is not None:
+            body += f", based on {trial_n} participants"
+        body += "."
+        if summary:
+            first_sentence = summary.split(". ")[0].strip().rstrip(".")
+            if first_sentence:
+                body += f" {first_sentence}."
+        action = item.get("actionable")
+        if action:
+            body += f" {action}."
+        body += " Want me to turn the finding into one practical listing/content change?"
+        return body, "open_ended", "Research message uses the referenced digest item and its source."
+
+    def _customer_message(
+        self,
+        merchant: dict[str, Any],
+        trigger: dict[str, Any],
+        customer: Optional[dict[str, Any]],
+        family: str,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        if not customer:
+            return None, None, None
+
+        ident = merchant.get("identity") or {}
+        customer_ident = customer.get("identity") or {}
+        relationship = customer.get("relationship") or {}
+        prefs = customer.get("preferences") or {}
+        payload = trigger.get("payload") or {}
+        cname = str(customer_ident.get("name") or "there")
+        business = str(ident.get("name") or "the clinic")
+        preferred = str(prefs.get("preferred_slots") or "")
+
+        if family == "customer":
+            kind = str(trigger.get("kind") or "")
+            if "recall_due" in kind:
+                service = str(payload.get("service_due") or "your next appointment").replace("_", " ")
+                due = self._date(payload.get("due_date"))
+                slot = self._slot_text(payload, preferred)
+                body = f"Hi {cname}, {business} here — your {service} recall is due"
+                if due:
+                    body += f" on {due}"
+                if slot:
+                    body += f". We have {slot} available"
+                body += ". Would you like me to hold it for you?"
+                return body, "binary_yes_no", "Recall message uses the customer's due date and available slot."
+
+            if "bridal" in kind or "wedding" in kind:
+                wedding = self._date(payload.get("wedding_date") or prefs.get("wedding_date"))
+                window = str(payload.get("next_step_window_open") or "the next preparation step").replace("_", " ")
+                body = f"Hi {cname}, {business} here — with your wedding on {wedding}, your next step is {window}."
+                body += " Would you like us to plan that appointment?"
+                return body, "binary_yes_no", "Bridal follow-up uses the wedding date and next-step window."
+
+            if "trial" in kind:
+                trial_date = self._date(payload.get("trial_date"))
+                slot = self._slot_text(payload, preferred)
+                body = f"Hi {cname}, thanks for coming in on {trial_date}."
+                if slot:
+                    body += f" Your next session option is {slot}."
+                body += " Would you like me to reserve it?"
+                return body, "binary_yes_no", "Trial follow-up uses the actual trial date and next-session option."
+
+            if "refill" in kind:
+                molecules = payload.get("molecule_list") or []
+                runout = self._date(payload.get("stock_runs_out_iso"))
+                body = f"Hi {cname}, {business} here — your regular medicines ({', '.join(str(x) for x in molecules[:3])}) are due for a refill."
+                if runout:
+                    body += f" Current stock is expected to run out around {runout}."
+                if prefs.get("delivery_address") == "saved" or payload.get("delivery_address_saved"):
+                    body += " Your delivery address is already saved."
+                body += " Would you like us to arrange the refill?"
+                return body, "binary_yes_no", "Refill message uses the medicine list, timing and saved delivery context."
+
+            if "lapsed" in kind or "winback" in kind:
+                days = payload.get("days_since_last_visit")
+                focus = str(payload.get("previous_focus") or "your previous goal").replace("_", " ")
+                body = f"Hi {cname}, it has been {days} days since your last visit to {business}."
+                body += f" You previously focused on {focus}."
+                body += " Would you like to pick that back up?"
+                return body, "binary_yes_no", "Win-back message uses the customer's lapse duration and previous focus."
+
+        # Generic customer fallback still uses relationship data.
+        last_visit = self._date(relationship.get("last_visit"))
+        service = ", ".join(str(x).replace("_", " ") for x in (relationship.get("services_received") or [])[-2:])
+        body = f"Hi {cname}, {business} here"
+        if last_visit:
+            body += f" — your last visit was {last_visit}"
+        if service:
+            body += f" for {service}"
+        body += ". Would you like an update on your next step?"
+        return body, "binary_yes_no", "Customer fallback uses relationship context rather than a generic update."
+
+    def _deterministic_reply(self, intent: str, pending_action: Optional[str]) -> dict[str, Any]:
+        if intent == "stop":
+            return {"action": "end", "rationale": "deterministic_stop"}
+        if intent == "accept":
+            return {
+                "action": "send",
+                "body": "Great — I’ll move to the next step now.",
+                "cta": "none",
+                "rationale": "deterministic_accept",
+            }
+        if intent == "auto_reply":
+            return {"action": "wait", "wait_seconds": 3600, "rationale": "wait_out_auto_reply"}
+        if intent == "decline":
+            return {
+                "action": "send",
+                "body": "Understood — I’ll leave it there for now.",
+                "cta": "none",
+                "rationale": "deterministic_decline",
+            }
+        if intent == "question":
+            return {
+                "action": "send",
+                "body": "I’ll answer that using the details already available and keep the next step simple.",
+                "cta": "none",
+                "rationale": "deterministic_question",
+            }
+        return {
+            "action": "send",
+            "body": "Understood. Let me know if you need anything else.",
+            "cta": "none",
+            "rationale": "deterministic_other",
+        }
+
+
+composer = LLMComposer()
